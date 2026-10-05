@@ -7,6 +7,7 @@ Compatible con Linux, Windows y Termux.
 
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -250,6 +251,8 @@ LETTERS = {
 
 TITLE = "OSIGHOST"
 SUBTITLE = "Herramienta creada por Pennywise"
+VERSION = "1.0"
+REPO_URL = "https://github.com/Pennywissse/OSIGhost"
 DRIP_ROWS = 5
 
 
@@ -288,21 +291,46 @@ def clear():
     os.system("cls" if os.name == "nt" else "clear")
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def visible_len(texto):
+    """Largo de un texto sin contar los códigos de color."""
+    return len(_ANSI.sub("", texto))
+
+
+def box_min_inner():
+    """Ancho interno mínimo para que entren los textos del cartel."""
+    return max(len(SUBTITLE), len(REPO_URL)) + 4
+
+
+def box_inner_width(width=None):
+    """Ancho interno de los recuadros (cartel y footer comparten el mismo).
+    Se adapta a la terminal: ~75% del ancho, entre el mínimo y 110 columnas."""
+    minimo = box_min_inner()
+    if width is None:
+        return minimo
+    objetivo = min(int(width * 0.75), 110) - 2
+    return max(minimo, objetivo)
+
+
 def subtitle_box(width):
-    """Subtítulo dentro de un contenedor de doble línea (╔═╗ ║ ╚═╝):
-    borde rojo y texto en rojo + negrita. Devuelve las líneas ya centradas.
+    """Cartel de doble línea (╔═╗ ║ ╚═╝) con el autor y la URL del repositorio:
+    borde rojo, texto en rojo + negrita. Devuelve las líneas ya centradas.
     Si la terminal es muy angosta, cae a texto simple en rojo/negrita."""
-    inner = f"  {SUBTITLE}  "
-    box_w = len(inner) + 2
+    textos = [SUBTITLE, REPO_URL]
+    ancho_txt = max(len(t) for t in textos)
+    inner_w = box_inner_width(width)
+    box_w = inner_w + 2
 
     if box_w > width:
-        return [f"{BOLD}{RED}{SUBTITLE.center(width)}{RESET}"]
+        return [f"{BOLD}{RED}{t.center(width)}{RESET}" for t in textos]
 
     pad = " " * ((width - box_w) // 2)
-    top = f"{RED}╔{'═' * len(inner)}╗{RESET}"
-    mid = f"{RED}║{BOLD}{inner}{RESET}{RED}║{RESET}"
-    bot = f"{RED}╚{'═' * len(inner)}╝{RESET}"
-    return [pad + top, pad + mid, pad + bot]
+    top = f"{RED}╔{'═' * inner_w}╗{RESET}"
+    bot = f"{RED}╚{'═' * inner_w}╝{RESET}"
+    medio = [f"{RED}║{BOLD}{t.center(inner_w)}{RESET}{RED}║{RESET}" for t in textos]
+    return [pad + top] + [pad + m for m in medio] + [pad + bot]
 
 
 def show_banner():
@@ -699,7 +727,7 @@ def opcion_diagnostico_reporte():
         render_opciones(sub_menu, salir_label="VOLVER")
 
         try:
-            choice = input(f"{RED}DIAGNÓSTICO{WHITE} > {RESET}").strip()
+            choice = pedir_opcion("DIAGNÓSTICO")
         except (KeyboardInterrupt, EOFError):
             choice = "0"
 
@@ -753,7 +781,7 @@ def opcion_geolocalizacion():
         render_opciones(sub_menu, salir_label="VOLVER")
 
         try:
-            choice = input(f"{RED}GEOLOCALIZACIÓN{WHITE} > {RESET}").strip()
+            choice = pedir_opcion("GEOLOCALIZACIÓN")
         except (KeyboardInterrupt, EOFError):
             choice = "0"
 
@@ -802,14 +830,17 @@ MAX_COLS = 3
 COLUMN_THRESHOLD = 10  # a partir de cuántas opciones se arma en columnas
 
 
+_PAD_MENU = 0  # margen izquierdo del último menú dibujado (lo usa el prompt)
+
+
 def render_opciones(items_dict, salir_label="SALIR", salir_key="0"):
-    """Lista [1]..[N] + [0] <salir_label>. Si hay más de COLUMN_THRESHOLD
-    opciones, las reparte en hasta MAX_COLS columnas (mismo estilo, solo
-    cambia el acomodo); si no, una sola columna como siempre. La usan
-    tanto el menú principal como el submenú de Diagnóstico y Reporte."""
+    """Lista [1]..[N] + [0] <salir_label>, centrada como bloque en la
+    terminal (la alineación interna se mantiene). Si hay más de
+    COLUMN_THRESHOLD opciones, las reparte en hasta MAX_COLS columnas.
+    La usan el menú principal y los submenús."""
+    global _PAD_MENU
     items = list(items_dict.items()) + [(salir_key, (salir_label, None))]
     num_w = max(len(f"[{k}]") for k, _ in items) + 1
-    indent = " " * 4
 
     def celda_texto(key, label):
         return f"[{key}]".ljust(num_w) + " ── " + label
@@ -817,30 +848,89 @@ def render_opciones(items_dict, salir_label="SALIR", salir_key="0"):
     def celda_color(key, label):
         return f"{RED}{f'[{key}]'.ljust(num_w)}{WHITE} ── {label}{RESET}"
 
+    width = term_width()
+    lineas = []  # (texto_coloreado, largo_visible)
+
     if len(items) <= COLUMN_THRESHOLD:
         for key, (label, _) in items:
-            print(f"{indent}{celda_color(key, label)}")
-        print()
-        return
+            lineas.append((celda_color(key, label), len(celda_texto(key, label))))
+    else:
+        ancho_celda = max(len(celda_texto(k, v[0])) for k, v in items)
+        cols = max(1, min(MAX_COLS, width // (ancho_celda + 3)))
+        # las columnas se separan para ocupar el mismo ancho que los recuadros
+        objetivo = min(box_inner_width(width) + 2, width - 2)
+        extra = (objetivo - cols * ancho_celda) // (cols - 1) if cols > 1 else 3
+        separador = " " * max(3, extra)
+        filas = -(-len(items) // cols)  # ceil division, orden por columnas
+        for r in range(filas):
+            partes, largo = [], 0
+            for c in range(cols):
+                idx = c * filas + r
+                if idx >= len(items):
+                    continue
+                key, (label, _) = items[idx]
+                texto = celda_texto(key, label)
+                pad = " " * (ancho_celda - len(texto))
+                partes.append(celda_color(key, label) + pad)
+            linea = separador.join(partes).rstrip()
+            lineas.append((linea, visible_len(linea)))
 
-    ancho_celda = max(len(celda_texto(k, v[0])) for k, v in items)
-    separador = "   "
-    width = term_width()
-    cols = max(1, min(MAX_COLS, (width - len(indent)) // (ancho_celda + len(separador))))
-
-    filas = -(-len(items) // cols)  # ceil division, orden por columnas
-    for r in range(filas):
-        partes = []
-        for c in range(cols):
-            idx = c * filas + r
-            if idx >= len(items):
-                continue
-            key, (label, _) = items[idx]
-            texto = celda_texto(key, label)
-            pad = " " * (ancho_celda - len(texto))
-            partes.append(celda_color(key, label) + pad)
-        print(indent + separador.join(partes).rstrip())
+    bloque = max(l for _, l in lineas)
+    if len(items) <= COLUMN_THRESHOLD and box_inner_width(width) + 2 <= width:
+        # una sola columna: alineada dentro del ancho de los recuadros
+        caja_izq = (width - (box_inner_width(width) + 2)) // 2
+        _PAD_MENU = caja_izq + max((box_inner_width(width) + 2 - bloque) // 4, 2)
+    else:
+        _PAD_MENU = max((width - bloque) // 2, 0)
+    sangria = " " * _PAD_MENU
+    for texto, _ in lineas:
+        print(sangria + texto)
     print()
+
+
+def pedir_opcion(etiqueta, footer=False):
+    """Lee la opción del menú alineada con el bloque de opciones. Con
+    footer=True, el recuadro del pie queda DEBAJO de la línea de tipeo:
+    se reserva la línea, se dibuja el pie y el cursor vuelve a subir."""
+    sangria = " " * _PAD_MENU
+    prompt = f"{sangria}{RED}{etiqueta}{WHITE} > {RESET}"
+    if not footer:
+        return input(prompt).strip()
+
+    pie = footer_box(term_width())
+    print()                       # línea reservada para el tipeo
+    for linea in pie:
+        print(linea)
+    sys.stdout.write(f"\033[{len(pie) + 1}A\r")   # volver a la línea de tipeo
+    sys.stdout.flush()
+    try:
+        return input(prompt).strip()
+    finally:
+        sys.stdout.write(f"\033[{len(pie)}B\r")  # bajar pasando el pie
+        sys.stdout.flush()
+
+
+def footer_box(width):
+    """Recuadro de pie (mismo estilo y ancho que el cartel de arriba):
+    versión a la izquierda y tecla de actualización a la derecha."""
+    izq_txt, der_txt = f"OSIGhost v{VERSION}", "[X] Buscar actualizaciones"
+    inner_w = box_inner_width(width)
+    box_w = inner_w + 2
+
+    if box_w > width or len(izq_txt) + len(der_txt) + 4 > inner_w:
+        l1, l2 = izq_txt, "[X] Buscar actualizaciones"
+        return [" " * max((width - len(l1)) // 2, 0) + f"{WHITE}{l1}{RESET}",
+                " " * max((width - len(l2)) // 2, 0) + f"{RED}[X]{WHITE} Buscar actualizaciones{RESET}"]
+
+    hueco = " " * (inner_w - 2 - len(izq_txt) - len(der_txt))
+    contenido = (f" {WHITE}{izq_txt}{RESET}{hueco}"
+                 f"{RED}[X]{WHITE} Buscar actualizaciones{RESET} ")
+    pad = " " * ((width - box_w) // 2)
+    return [
+        pad + f"{RED}╔{'═' * inner_w}╗{RESET}",
+        pad + f"{RED}║{RESET}{contenido}{RED}║{RESET}",
+        pad + f"{RED}╚{'═' * inner_w}╝{RESET}",
+    ]
 
 
 def show_menu():
@@ -865,13 +955,23 @@ def main():
         show_banner()
         show_menu()
         try:
-            choice = input(f"{RED}OSIGhost{WHITE} > {RESET}").strip()
+            choice = pedir_opcion("OSIGhost", footer=True)
         except (KeyboardInterrupt, EOFError):
             choice = "0"
 
         if choice == "0":
             print(f"\n{WHITE}Hasta luego.{RESET}")
             break
+        if choice.lower() == "x":
+            import updater
+            try:
+                updater.buscar_y_actualizar()
+            except KeyboardInterrupt:
+                print(f"\n{RED}[-]{RESET} Interrumpido.")
+            except Exception as exc:
+                print(f"\n{RED}[-]{RESET} Error al buscar actualizaciones : {exc}")
+            pausar()
+            continue
         if choice in MENU:
             label, func = MENU[choice]
             try:

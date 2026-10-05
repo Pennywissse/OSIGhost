@@ -19,13 +19,132 @@ Esta herramienta está diseñada **exclusivamente** para ser usada sobre sistema
 
 ## Instalación
 
+Requiere **Python 3.9 o superior** y conexión a internet (consultas DNS/WHOIS/RDAP, geolocalización, certificados, etc.).
+
+### Kali Linux (y Debian / Ubuntu)
+
+**1. Actualizar el sistema**
+
 ```bash
+sudo apt update && sudo apt full-upgrade -y
+```
+
+**2. Instalar lo necesario**
+
+```bash
+sudo apt install -y python3 python3-pip python3-venv git
+```
+
+**3. Descargar OSIGhost**
+
+```bash
+git clone git@github.com:Pennywissse/OSIGhost.git      # repo privado: necesita tu clave SSH cargada en GitHub
+# o por HTTPS (pide usuario y Personal Access Token como contraseña):
+# git clone https://github.com/Pennywissse/OSIGhost.git
+cd OSIGhost
+```
+
+**4. Entorno virtual + dependencias** (recomendado: Kali y Debian recientes bloquean `pip` global por la norma PEP 668 con el error `externally-managed-environment`)
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### La pantalla de inicio chequea tu entorno de verdad
+**5. Ejecutar**
 
-Al correr `python3 osighost.py`, mientras se ve la cara de Pennywise y la barra de carga, el paso **"Verificando dependencias..."** no es cosmético: usa `importlib` para confirmar, en la máquina donde estás parado en ese momento, si están instalados `colorama`, `requests`, `beautifulsoup4`, `lxml`, `dnspython`, `cryptography`, `tldextract` y `psutil`.
+```bash
+python3 osighost.py
+```
+
+> Cada vez que abras una terminal nueva, volvé a activar el entorno con `source venv/bin/activate` antes de ejecutar OSIGhost.
+> Si preferís no usar entorno virtual: `pip install -r requirements.txt --break-system-packages`.
+
+**Actualizar OSIGhost y el sistema más adelante**
+
+```bash
+sudo apt update && sudo apt full-upgrade -y     # sistema
+cd OSIGhost && git pull                          # herramienta
+source venv/bin/activate
+pip install --upgrade -r requirements.txt        # dependencias
+```
+
+---
+
+### Termux (Android)
+
+> Instalá Termux desde **F-Droid** o desde su página oficial de GitHub. La versión de Google Play está desactualizada y falla con los repositorios.
+
+**1. Actualizar el sistema**
+
+```bash
+pkg update -y && pkg upgrade -y
+```
+
+**2. Instalar lo necesario** (incluye las librerías para compilar `lxml`, `cryptography`, `psutil` y `Pillow`)
+
+```bash
+pkg install -y python git clang make rust openssl libffi libxml2 libxslt libjpeg-turbo libpng zlib
+```
+
+**3. Descargar OSIGhost**
+
+```bash
+git clone https://github.com/Pennywissse/OSIGhost.git    # repo privado: usuario + Personal Access Token como contraseña
+cd OSIGhost
+```
+
+Con repo privado y SSH: `pkg install -y openssh`, `ssh-keygen -t ed25519`, cargá `~/.ssh/id_ed25519.pub` en GitHub y clonás con `git@github.com:Pennywissse/OSIGhost.git`.
+
+**4. Dependencias**
+
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+La primera instalación de `lxml`, `cryptography` y `Pillow` compila desde el código fuente y puede tardar varios minutos.
+
+**5. Ejecutar**
+
+```bash
+python osighost.py
+```
+
+**Actualizar más adelante**
+
+```bash
+pkg update -y && pkg upgrade -y
+cd OSIGhost && git pull
+pip install --upgrade -r requirements.txt
+```
+
+**Limitaciones en Termux**
+
+- Android restringe `psutil` y el acceso a `/proc`: la *Auditoría Local* y algunos datos de red del equipo pueden salir incompletos.
+- El *Descubrir Red (LAN)* no puede leer la tabla ARP sin root, así que la MAC y el fabricante pueden no aparecer.
+- Para guardar reportes y exportaciones en el almacenamiento del teléfono ejecutá una vez `termux-setup-storage` y copiá desde `reportes/` a `~/storage/shared/`.
+
+---
+
+### Windows
+
+```powershell
+git clone https://github.com/Pennywissse/OSIGhost.git
+cd OSIGhost
+py -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+py osighost.py
+```
+
+---
+
+### Primer arranque: chequeo de dependencias
+
+Al correr `python3 osighost.py`, mientras se ve la cara de Pennywise y la barra de carga, el paso **"Verificando dependencias..."** no es cosmético: usa `importlib` para confirmar, en la máquina donde estás parado en ese momento, si están instalados `colorama`, `requests`, `beautifulsoup4`, `lxml`, `dnspython`, `cryptography`, `tldextract`, `psutil`, `phonenumbers`, `Pillow` y `pypdf`.
 
 Si falta algo, apenas termina el splash te lo muestra y te pregunta:
 
@@ -57,10 +176,60 @@ Si confirmás, corre `pip install --upgrade <paquete>` por cada uno (siempre la 
 ```
 osighost.py        → punto de entrada: splash, menú principal, chequeo de dependencias
 recon.py           → funciones de reconocimiento orientadas a un dominio/IP (headers, ssl, whois, dns, etc.)
+geoloc.py          → opción 2: geolocalización (IP, lotes, infraestructura, metadatos, teléfono, mapa/CSV)
 netsec.py          → librería de auditoría (TLS, archivos sensibles, secretos) + herramientas
                       de infraestructura (puertos, red local, auditoría local) + reportes
 wordlists/common.txt → wordlist para Fuerza de Directorios
-reportes/          → se crea sola al generar el primer reporte (HTML + TXT)
+reportes/          → se crea sola al generar el primer reporte (HTML + TXT); excluida de Git
+```
+
+---
+
+## Cómo se usa
+
+```bash
+python3 osighost.py          # (en Termux / Windows: python osighost.py)
+```
+
+Arranca con la pantalla de inicio y el chequeo de dependencias, y después muestra el menú principal. Se navega escribiendo el número de la opción y `ENTER`; **`0`** vuelve atrás o sale, y **`Ctrl+C`** interrumpe la herramienta en curso sin cerrar el programa.
+
+### Flujo típico de un relevamiento
+
+1. **Alcance:** confirmá por escrito qué dominios, IPs y rangos están dentro del contrato.
+2. **Opción 1 · Diagnóstico y Reporte:** corré las herramientas que correspondan sobre el dominio del cliente (Headers, SSL/TLS, DNS, Subdominios, Puertos, etc.).
+3. **Opción 2 · Geolocalización:** ubicá la infraestructura (`3`), analizá los logs de acceso del cliente (`2`) y revisá los documentos publicados (`4` / `5`).
+4. **Generar el reporte:** volvé a la opción 1 y entrá a *Generar Reporte de la Sesión*. Queda en `reportes/` como HTML y TXT.
+5. **Exportar geolocalización:** en la opción 2 → `7`, que genera el mapa y el CSV en `reportes/geolocalizacion/`.
+
+### Ejemplos rápidos
+
+| Querés... | Camino |
+|---|---|
+| Ver dónde está alojado un dominio | `2` → `1` → `ejemplo.com` |
+| Ver desde qué países entran a un servidor | `2` → `2` → archivo de log → países esperados (ej: `AR,US`) |
+| Saber si los servidores de correo y DNS están fuera del país | `2` → `3` → `ejemplo.com` → países esperados |
+| Revisar si las fotos o PDFs publicados filtran GPS o autores | `2` → `5` → carpeta con los archivos descargados |
+| Validar la numeración de un teléfono de contacto | `2` → `6` → `+54 11 5555-1234` |
+| Escanear los puertos de un servidor del cliente | `1` → `9` → IP o dominio |
+| Entregar el informe | `1` → `12` |
+
+### Dónde queda todo lo generado
+
+```
+reportes/osighost_reporte_AAAAMMDD_HHMMSS.html|txt     ← reporte de la sesión
+reportes/geolocalizacion/geolocalizacion_*.csv|html     ← datos y mapa de geolocalización
+```
+
+La carpeta `reportes/` contiene información de clientes: está excluida de Git por el `.gitignore` y **nunca** debe subirse al repositorio.
+
+---
+
+## Actualizar el repositorio (desarrollo)
+
+```bash
+git add .
+git commit -m "Descripción del cambio"
+git push
 ```
 
 ---
