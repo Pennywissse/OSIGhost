@@ -831,6 +831,7 @@ COLUMN_THRESHOLD = 10  # a partir de cuántas opciones se arma en columnas
 
 
 _PAD_MENU = 0  # margen izquierdo del último menú dibujado (lo usa el prompt)
+MENU_SHIFT = 3  # columnas que se corre el menú a la izquierda del centro exacto
 
 
 def render_opciones(items_dict, salir_label="SALIR", salir_key="0"):
@@ -882,6 +883,7 @@ def render_opciones(items_dict, salir_label="SALIR", salir_key="0"):
         _PAD_MENU = caja_izq + max((box_inner_width(width) + 2 - bloque) // 4, 2)
     else:
         _PAD_MENU = max((width - bloque) // 2, 0)
+    _PAD_MENU = max(_PAD_MENU - MENU_SHIFT, 0)
     sangria = " " * _PAD_MENU
     for texto, _ in lineas:
         print(sangria + texto)
