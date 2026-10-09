@@ -25,13 +25,17 @@ opción del menú para poder exportarla después como reporte para el
 equipo de IT (opción REPORTE Y DIAGNÓSTICO).
 """
 
+import csv
 import datetime
+import difflib
 import getpass
 import io
 import ipaddress
+import json
 import os
 import platform
 import re
+import shutil
 import socket
 import ssl
 import subprocess
@@ -1422,10 +1426,17 @@ def _limpiar_salida(texto):
 
 
 def run_and_log(label, func):
-    """Ejecuta func() mostrando la salida normal en pantalla y, a la vez,
-    la guarda (sin códigos de color) para el generador de reportes. Si la
+    """Ejecuta func() mostrando la salida normal en pantalla y, si hay un
+    reporte abierto (ver REPORT_SESSION), la guarda también (sin códigos
+    de color) para el generador de reportes. Si no hay ningún reporte
+    abierto, la herramienta corre igual pero no se guarda nada: hay que
+    abrir un reporte primero (tecla [C] en el menú principal). Si la
     herramienta falla o se interrumpe, lo que alcanzó a imprimir igual se
     guarda."""
+    if not REPORT_SESSION["activo"]:
+        func()
+        return
+
     buf = io.StringIO()
     real_out = sys.__stdout__ or sys.stdout
     tee = _Tee(real_out, buf)
@@ -1449,13 +1460,132 @@ def clear_report_log():
 
 
 # ---------------------------------------------------------------------------
-# 5. Generador de reportes (para el equipo de IT del cliente)
+# 5. Sesión de reporte: Crear reporte / Cerrar reporte (menú principal)
 # ---------------------------------------------------------------------------
+# Mientras no haya un reporte abierto, lo que se corre en Diagnóstico y
+# Geolocalización se ve en pantalla como siempre pero NO se guarda. Al
+# abrir un reporte (nombre + fecha) empieza a quedar registrado todo lo
+# que se ejecute, hasta que se cierra (pide fecha de cierre y en qué
+# formato(s) exportarlo). Cerrar vacía REPORT_LOG para que un reporte
+# nuevo no arrastre herramientas del anterior.
+REPORT_SESSION = {
+    "activo": False,
+    "nombre": None,
+    "fecha_inicio": None,
+    "carpeta": None,
+}
+
+FORMATOS_DISPONIBLES = ("html", "txt", "json", "md")
+
+
+def _sanear_nombre(nombre):
+    """Deja un nombre de archivo seguro: letras/números/espacios -> '_',
+    saca cualquier otro símbolo (de paso evita path traversal tipo '../')."""
+    limpio = re.sub(r"[^A-Za-z0-9ÁÉÍÓÚÑáéíóúñ _-]", "", nombre).strip()
+    limpio = re.sub(r"\s+", "_", limpio)
+    return limpio or "sin_nombre"
+
+
+def reporte_activo():
+    return REPORT_SESSION["activo"]
+
+
+def iniciar_reporte(nombre, fecha, out_dir="reportes"):
+    _section("Crear Reporte")
+    if REPORT_SESSION["activo"]:
+        return _warn(f"Ya hay un reporte abierto: '{REPORT_SESSION['nombre']}'. "
+                      f"Cerralo primero (opción [C] del menú principal) antes de abrir uno nuevo.")
+
+    nombre_limpio = _sanear_nombre(nombre or "")
+    fecha = (fecha or "").strip() or datetime.datetime.now().strftime("%Y-%m-%d")
+
+    os.makedirs(out_dir, exist_ok=True)
+    REPORT_LOG.clear()
+    REPORT_SESSION.update({
+        "activo": True,
+        "nombre": nombre_limpio,
+        "fecha_inicio": fecha,
+        "carpeta": out_dir,
+    })
+    _ok(f"Reporte '{nombre_limpio}' abierto  ·  fecha : {fecha}")
+    _info("A partir de ahora, todo lo que corras en Diagnóstico y Reporte / "
+          "Geolocalización queda registrado acá.")
+    _info("Cuando termines el relevamiento, volvé al menú principal y elegí "
+          "[C] Cerrar reporte para exportarlo.")
+
+
+def cerrar_reporte(fecha_cierre, formatos, out_dir=None):
+    _section("Cerrar Reporte")
+    if not REPORT_SESSION["activo"]:
+        return _warn("No hay ningún reporte abierto. Primero abrilo con [C] Crear reporte.")
+
+    if not REPORT_LOG:
+        _warn("El reporte se cierra sin ningún módulo registrado (no se corrió nada mientras estuvo abierto).")
+
+    formatos = [f for f in (formatos or []) if f in FORMATOS_DISPONIBLES] or ["html", "txt"]
+    out_dir = out_dir or REPORT_SESSION["carpeta"] or "reportes"
+    os.makedirs(out_dir, exist_ok=True)
+
+    nombre = REPORT_SESSION["nombre"]
+    fecha_inicio = REPORT_SESSION["fecha_inicio"]
+    fecha_cierre = (fecha_cierre or "").strip() or datetime.datetime.now().strftime("%Y-%m-%d")
+    # milisegundos incluidos: si se cierran dos reportes en el mismo segundo
+    # (común al probar o en sesiones muy cortas), el nombre no debe colisionar.
+    sello = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    basename = f"{nombre}_{sello}"
+
+    meta = {
+        "nombre": nombre,
+        "fecha_inicio": fecha_inicio,
+        "fecha_cierre": fecha_cierre,
+        "generado": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "cantidad_modulos": len(REPORT_LOG),
+    }
+
+    rutas = []
+    if "html" in formatos:
+        rutas.append(_escribir_reporte_html(out_dir, basename, meta))
+    if "txt" in formatos:
+        rutas.append(_escribir_reporte_txt(out_dir, basename, meta))
+    if "json" in formatos:
+        rutas.append(_escribir_reporte_json(out_dir, basename, meta))
+    if "md" in formatos:
+        rutas.append(_escribir_reporte_md(out_dir, basename, meta))
+
+    _ok(f"Reporte '{nombre}'  ·  {fecha_inicio} → {fecha_cierre}")
+    _ok(f"Módulos incluidos : {len(REPORT_LOG)}")
+    for r in rutas:
+        _ok(f"Generado : {r}")
+
+    REPORT_LOG.clear()
+    REPORT_SESSION.update({"activo": False, "nombre": None, "fecha_inicio": None, "carpeta": None})
+
+
+# Se mantiene por compatibilidad (no se usa desde el menú, que ahora usa
+# iniciar_reporte/cerrar_reporte): genera HTML+TXT de lo acumulado al toque,
+# sin pasar por el ciclo de sesión.
+def mod_report(out_dir="reportes", basename=None):
+    _section("Generador de Reportes")
+    if not REPORT_LOG:
+        return _warn("Todavía no se registró ningún módulo para incluir en el reporte.")
+    os.makedirs(out_dir, exist_ok=True)
+    basename = basename or f"osighost_reporte_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    meta = {
+        "nombre": basename,
+        "fecha_inicio": "",
+        "fecha_cierre": "",
+        "generado": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "cantidad_modulos": len(REPORT_LOG),
+    }
+    _ok(f"Reporte HTML : {_escribir_reporte_html(out_dir, basename, meta)}")
+    _ok(f"Reporte TXT  : {_escribir_reporte_txt(out_dir, basename, meta)}")
+
+
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<title>Reporte OSIGhost</title>
+<title>Reporte OSIGhost{titulo_sufijo}</title>
 <style>
   body {{ background:#0d0d0d; color:#eaeaea; font-family: Consolas, 'Courier New', monospace; margin:0; padding:2rem; }}
   h1 {{ color:#ff3b3b; border-bottom:1px solid #440000; padding-bottom:.5rem; }}
@@ -1468,7 +1598,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <h1>Reporte de Seguridad &mdash; OSIGhost</h1>
-<p class="meta">Generado : {generado}<br>Módulos ejecutados : {cantidad}</p>
+<p class="meta">
+  Nombre : {nombre}<br>
+  Fecha inicio : {fecha_inicio} &nbsp;&middot;&nbsp; Fecha cierre : {fecha_cierre}<br>
+  Generado : {generado}<br>
+  Módulos ejecutados : {cantidad_modulos}
+</p>
 {bloques}
 </body>
 </html>
@@ -1486,14 +1621,7 @@ def _html_escape(text):
     return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def mod_report(out_dir="reportes", basename=None):
-    _section("Generador de Reportes")
-    if not REPORT_LOG:
-        return _warn("Todavía no se ejecutó ningún módulo en esta sesión para incluir en el reporte.")
-
-    os.makedirs(out_dir, exist_ok=True)
-    basename = basename or f"osighost_reporte_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
+def _escribir_reporte_html(out_dir, basename, meta):
     bloques = "".join(
         BLOQUE_TEMPLATE.format(
             modulo=_html_escape(e["modulo"]),
@@ -1501,26 +1629,384 @@ def mod_report(out_dir="reportes", basename=None):
             salida=_html_escape(e["salida"]),
         ) for e in REPORT_LOG
     )
-    html = HTML_TEMPLATE.format(
-        generado=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        cantidad=len(REPORT_LOG),
-        bloques=bloques,
-    )
-
-    html_path = os.path.join(out_dir, basename + ".html")
-    txt_path = os.path.join(out_dir, basename + ".txt")
-
-    with open(html_path, "w", encoding="utf-8") as f:
+    titulo_sufijo = f" — {meta['nombre']}" if meta.get("nombre") else ""
+    html = HTML_TEMPLATE.format(titulo_sufijo=titulo_sufijo, bloques=bloques, **meta)
+    path = os.path.join(out_dir, basename + ".html")
+    with open(path, "w", encoding="utf-8") as f:
         f.write(html)
+    return path
 
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write(f"REPORTE OSIGHOST - {datetime.datetime.now()}\n")
+
+def _escribir_reporte_txt(out_dir, basename, meta):
+    path = os.path.join(out_dir, basename + ".txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"REPORTE OSIGHOST - {meta['nombre']}\n")
+        f.write(f"Fecha inicio : {meta['fecha_inicio']}    Fecha cierre : {meta['fecha_cierre']}\n")
+        f.write(f"Generado     : {meta['generado']}\n")
         f.write("=" * 60 + "\n\n")
         for e in REPORT_LOG:
             f.write(f"[{e['timestamp']}] {e['modulo']}\n")
             f.write("-" * 60 + "\n")
             f.write(e["salida"] + "\n\n")
+    return path
 
-    _ok(f"Módulos incluidos : {len(REPORT_LOG)}")
-    _ok(f"Reporte HTML : {html_path}")
-    _ok(f"Reporte TXT  : {txt_path}")
+
+def _escribir_reporte_json(out_dir, basename, meta):
+    path = os.path.join(out_dir, basename + ".json")
+    data = {**meta, "modulos": REPORT_LOG}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def _escribir_reporte_md(out_dir, basename, meta):
+    path = os.path.join(out_dir, basename + ".md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# Reporte OSIGhost — {meta['nombre']}\n\n")
+        f.write(f"- **Fecha inicio:** {meta['fecha_inicio']}\n")
+        f.write(f"- **Fecha cierre:** {meta['fecha_cierre']}\n")
+        f.write(f"- **Generado:** {meta['generado']}\n")
+        f.write(f"- **Módulos ejecutados:** {meta['cantidad_modulos']}\n\n")
+        for e in REPORT_LOG:
+            f.write(f"## {e['modulo']}\n")
+            f.write(f"*{e['timestamp']}*\n\n")
+            f.write("```\n" + e["salida"].rstrip() + "\n```\n\n")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# 6. Escaneo avanzado vía nmap (SYN scan, UDP, fingerprint de SO, NSE)
+# ---------------------------------------------------------------------------
+# Estas técnicas necesitan sockets crudos (privilegios root/admin) y el
+# motor de huellas/scripts de nmap -- no tiene sentido reimplementarlas en
+# Python puro, así que se delega al binario real de nmap si está instalado.
+# Igual que el resto de OSIGhost: nada de --script con categorías de
+# explotación/ataque, solo detección (vuln = *detecta* CVEs conocidos por
+# firma/versión, no los explota; default/discovery = enumeración de solo
+# lectura).
+def _nmap_disponible():
+    return shutil.which("nmap") is not None
+
+
+def _ejecutar_nmap(args, descripcion, requiere_root=False, timeout=None):
+    if not _nmap_disponible():
+        _err("nmap no está instalado en este sistema.")
+        _info("Instalalo con: sudo apt install nmap   (Termux: pkg install nmap  ·  Windows: nmap.org)")
+        return
+    if requiere_root and not _is_admin():
+        _warn(f"{descripcion} necesita privilegios de administrador/root para armar paquetes crudos.")
+        _info("Volvé a correr OSIGhost con 'sudo' (Linux/Termux) o como Administrador (Windows).")
+        return
+
+    cmd = ["nmap"] + args
+    _info("Comando : " + " ".join(cmd))
+    _info("Ctrl+C corta el escaneo y deja lo que nmap alcanzó a imprimir.")
+    print()
+
+    proc = None
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, errors="replace", bufsize=1)
+        for line in proc.stdout:
+            print(line.rstrip())
+        proc.wait(timeout=timeout)
+    except KeyboardInterrupt:
+        if proc:
+            proc.terminate()
+        _warn("Escaneo interrumpido por el usuario.")
+    except FileNotFoundError:
+        _err("No se encontró el binario de nmap.")
+    except subprocess.TimeoutExpired:
+        if proc:
+            proc.kill()
+        _warn("Escaneo cortado por timeout.")
+
+
+def mod_nmap_scan(host, modo):
+    _section(f"Escaneo Avanzado (nmap) ─ {host}")
+
+    if modo == "syn":
+        _ejecutar_nmap(["-sS", "-Pn", "--top-ports", "1000", "-T4", host],
+                        "El SYN scan (-sS)", requiere_root=True)
+    elif modo == "udp":
+        _ejecutar_nmap(["-sU", "--top-ports", "100", "-T4", host],
+                        "El escaneo UDP (-sU)", requiere_root=True)
+    elif modo == "os":
+        _ejecutar_nmap(["-O", "-Pn", host],
+                        "El fingerprint de SO (-O)", requiere_root=True)
+    elif modo == "vuln":
+        _ejecutar_nmap(["-sV", "-Pn", "--script=vuln", "-T4", host],
+                        "Los scripts NSE de vulnerabilidades", requiere_root=False)
+    elif modo == "discovery":
+        _ejecutar_nmap(["-sV", "-sC", "-Pn", "-T4", host],
+                        "Los scripts NSE de descubrimiento", requiere_root=False)
+    elif modo == "full":
+        _info("Escaneo completo: todos los puertos + versión + SO + scripts. Puede tardar varios minutos.")
+        _ejecutar_nmap(["-sS", "-sV", "-O", "-p-", "--min-rate=1000", "-T4",
+                         "--script=default,vuln", host],
+                        "El escaneo completo profesional", requiere_root=True, timeout=1800)
+    else:
+        _err(f"Modo de escaneo desconocido: '{modo}'")
+
+
+# ---------------------------------------------------------------------------
+# 7. Contenedores / Docker expuesto
+# ---------------------------------------------------------------------------
+# Solo lectura: consulta endpoints de la propia API de Docker que, si el
+# motor está mal configurado, responden SIN autenticación (/version,
+# /containers/json, y el catálogo de un Registry v2). No se crea, ejecuta
+# ni modifica ningún contenedor -- es detección de la misma exposición que
+# ya explotan botnets automatizadas que escanean 2375/5000 todo el tiempo.
+def mod_docker_check(host):
+    _section(f"Contenedores / Docker Expuesto ─ {host}")
+
+    _sub("Puertos del Engine API")
+    _, abierto_2375, _ = _scan_one(host, 2375, 1.5)
+    _, abierto_2376, _ = _scan_one(host, 2376, 1.5)
+    print(f"   {GREEN if abierto_2375 else WHITE}2375/tcp{RESET} (API sin TLS)  "
+          f"{'ABIERTO' if abierto_2375 else 'cerrado'}")
+    print(f"   {GREEN if abierto_2376 else WHITE}2376/tcp{RESET} (API con TLS)  "
+          f"{'ABIERTO' if abierto_2376 else 'cerrado'}")
+
+    if abierto_2375 and requests is None:
+        _warn("2375 está abierto pero falta 'requests' para confirmar si es la API sin autenticar.")
+    elif abierto_2375:
+        _sub("Docker API sin TLS — probando acceso sin autenticación")
+        try:
+            r = requests.get(f"http://{host}:2375/version", timeout=6)
+        except Exception as exc:
+            r = None
+            _info(f"El puerto está abierto pero no se pudo leer /version : {exc}")
+        if r is not None and r.status_code == 200 and "ApiVersion" in r.text:
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+            _err(f"CRÍTICO: API Docker expuesta SIN autenticación. "
+                 f"Versión del motor : {data.get('Version', '?')}  ·  API : {data.get('ApiVersion', '?')}")
+            try:
+                rc = requests.get(f"http://{host}:2375/containers/json?all=1", timeout=6)
+                if rc.status_code == 200:
+                    conts = rc.json()
+                    _err(f"CRÍTICO: se pueden listar los contenedores sin credenciales ({len(conts)} encontrados).")
+                    for c in conts[:10]:
+                        nombre = (c.get("Names") or ["?"])[0]
+                        print(f"   {RED}{nombre}{RESET}  {c.get('Image', '?')}  ({c.get('State', '?')})")
+                    if len(conts) > 10:
+                        _info(f"... y {len(conts) - 10} más (truncado en pantalla).")
+            except Exception:
+                pass
+        elif r is not None:
+            _ok("El puerto 2375 responde pero no parece ser la API de Docker sin autenticar.")
+
+    if abierto_2376:
+        _info("2376 (TLS) abierto: por diseño pide certificado de cliente, no se puede confirmar "
+              "exposición sin credenciales desde acá.")
+
+    if not abierto_2375 and not abierto_2376:
+        _ok("Ningún puerto del Engine API (2375/2376) está abierto.")
+
+    if requests is not None:
+        _sub("Registro de imágenes (Docker Registry v2) en :5000")
+        try:
+            r = requests.get(f"http://{host}:5000/v2/_catalog", timeout=6)
+        except Exception:
+            r = None
+        if r is not None and r.status_code == 200 and "repositories" in r.text:
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+            repos = data.get("repositories", [])
+            _err(f"CRÍTICO: registry expuesto sin autenticación ({len(repos)} imágenes listadas).")
+            for repo in repos[:10]:
+                print(f"   {RED}{repo}{RESET}")
+        else:
+            _ok("El puerto 5000 no expone un catálogo de registry sin autenticar.")
+
+    _info("Nota: 'docker-compose.yml' expuesto por HTTP ya lo cubre la herramienta 'Fuerza de Directorios'.")
+
+
+# ---------------------------------------------------------------------------
+# 8. Búsqueda de CVEs (NVD) — cruza producto/versión con vulnerabilidades
+#    conocidas y les trae el score CVSS.
+# ---------------------------------------------------------------------------
+def mod_cve_lookup(keyword, max_resultados=10):
+    _section(f"Búsqueda de CVEs (NVD) ─ {keyword}")
+    if requests is None:
+        return _need("requests", "requests")
+
+    try:
+        r = requests.get(
+            "https://services.nvd.nist.gov/rest/json/cves/2.0",
+            params={"keywordSearch": keyword, "resultsPerPage": max_resultados},
+            headers=USER_AGENT, timeout=15,
+        )
+    except Exception as exc:
+        return _err(f"No se pudo consultar la NVD : {exc}")
+
+    if r.status_code == 404:
+        return _warn("Sin resultados para esa búsqueda.")
+    if r.status_code == 429:
+        return _warn("La NVD limitó la consulta (rate limit público, sin API key). Esperá un minuto y reintentá.")
+    if r.status_code != 200:
+        return _err(f"La NVD respondió {r.status_code}.")
+
+    try:
+        data = r.json()
+    except Exception:
+        return _err("Respuesta inesperada de la NVD (no es JSON válido).")
+
+    total = data.get("totalResults", 0)
+    vulns = data.get("vulnerabilities", [])
+    if not vulns:
+        return _ok(f"Sin CVEs encontrados para '{keyword}'.")
+
+    _info(f"{total} resultado(s) totales en la NVD  ·  mostrando {len(vulns)}")
+    for v in vulns:
+        cve = v.get("cve", {})
+        cve_id = cve.get("id", "?")
+        desc = next((d["value"] for d in cve.get("descriptions", []) if d.get("lang") == "en"), "")
+
+        score, severidad = None, None
+        for clave in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+            metrica = cve.get("metrics", {}).get(clave)
+            if metrica:
+                cvss = metrica[0].get("cvssData", {})
+                score = cvss.get("baseScore")
+                severidad = metrica[0].get("baseSeverity") or cvss.get("baseSeverity")
+                break
+
+        color = RED if (score or 0) >= 7 else (YELLOW if (score or 0) >= 4 else CYAN)
+        print(f"\n   {color}{cve_id}{RESET}  CVSS: {score if score is not None else '?'} ({severidad or '?'})")
+        if desc:
+            texto = desc if len(desc) <= 220 else desc[:220] + "…"
+            print(f"   {WHITE}{texto}{RESET}")
+
+    _info("Fuente: NVD (services.nvd.nist.gov) — consulta pública de solo lectura, sin API key.")
+
+
+# ---------------------------------------------------------------------------
+# 9. Gestión de Reportes: comparar dos reportes y exportar hallazgos a
+#    formato de ticket (CSV / CSV para importar en Jira).
+# ---------------------------------------------------------------------------
+def _cargar_reporte_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def comparar_reportes(path_a, path_b):
+    _section("Comparar Reportes")
+    try:
+        a = _cargar_reporte_json(path_a)
+        b = _cargar_reporte_json(path_b)
+    except FileNotFoundError as exc:
+        return _err(f"No se encontró el archivo : {exc.filename}")
+    except json.JSONDecodeError:
+        return _err("Alguno de los dos archivos no es un reporte JSON válido "
+                     "(hay que haberlo cerrado eligiendo el formato JSON).")
+
+    _info(f"Reporte A : {a.get('nombre', '?')}  ({a.get('fecha_inicio', '?')} → {a.get('fecha_cierre', '?')})")
+    _info(f"Reporte B : {b.get('nombre', '?')}  ({b.get('fecha_inicio', '?')} → {b.get('fecha_cierre', '?')})")
+
+    mods_a = {m["modulo"]: m["salida"] for m in a.get("modulos", [])}
+    mods_b = {m["modulo"]: m["salida"] for m in b.get("modulos", [])}
+    solo_a = sorted(set(mods_a) - set(mods_b))
+    solo_b = sorted(set(mods_b) - set(mods_a))
+    comunes = sorted(set(mods_a) & set(mods_b))
+
+    if solo_a:
+        _sub(f"Módulos que estaban en A y no se corrieron en B ({len(solo_a)})")
+        for m in solo_a:
+            print(f"   {YELLOW}{m}{RESET}")
+    if solo_b:
+        _sub(f"Módulos nuevos en B, no estaban en A ({len(solo_b)})")
+        for m in solo_b:
+            print(f"   {GREEN}{m}{RESET}")
+
+    _sub(f"Diferencias en módulos presentes en ambos reportes ({len(comunes)})")
+    sin_cambios = 0
+    for m in comunes:
+        diff = list(difflib.unified_diff(
+            mods_a[m].splitlines(), mods_b[m].splitlines(),
+            fromfile="A", tofile="B", lineterm="", n=0,
+        ))
+        if not diff:
+            sin_cambios += 1
+            continue
+        print(f"\n   {WHITE}❯ {m}{RESET}")
+        for linea in diff[2:32]:
+            if linea.startswith("+"):
+                print(f"     {GREEN}{linea}{RESET}")
+            elif linea.startswith("-"):
+                print(f"     {RED}{linea}{RESET}")
+            else:
+                print(f"     {linea}")
+        if len(diff) > 32:
+            print(f"     {CYAN}... diff truncado en pantalla ({len(diff) - 32} líneas más){RESET}")
+
+    _ok(f"Módulos sin cambios : {sin_cambios}/{len(comunes)}")
+
+
+# Líneas con severidad ya marcada por las propias herramientas de OSIGhost
+# (formato "[CRÍTICO]/[ALTO]/[MEDIO]/[BAJO]" de _print_findings, o la marca
+# puntual "⚠ CRÍTICO" que usa Fuerza de Directorios para archivos sensibles).
+_SEV_LINE_RE = re.compile(r"\[(CRÍTICO|ALTO|MEDIO|BAJO)\]")
+_SEV_TAG_RE = re.compile(r"⚠\s*CRÍTICO")
+JIRA_PRIORIDAD = {"CRÍTICO": "Highest", "ALTO": "High", "MEDIO": "Medium", "BAJO": "Low"}
+
+
+def _extraer_hallazgos(modulos):
+    hallazgos = []
+    for mod in modulos:
+        nombre = mod.get("modulo", "?")
+        for linea in mod.get("salida", "").splitlines():
+            texto = linea.strip()
+            if not texto:
+                continue
+            m = _SEV_LINE_RE.search(texto)
+            sev = m.group(1) if m else ("CRÍTICO" if _SEV_TAG_RE.search(texto) else None)
+            if sev:
+                hallazgos.append({"severidad": sev, "modulo": nombre, "descripcion": texto})
+    return hallazgos
+
+
+def exportar_hallazgos(path_reporte, formato="csv", out_dir="reportes"):
+    _section("Exportar Hallazgos a Ticket")
+    try:
+        data = _cargar_reporte_json(path_reporte)
+    except FileNotFoundError:
+        return _err(f"No se encontró el archivo : {path_reporte}")
+    except json.JSONDecodeError:
+        return _err("El archivo no es un reporte JSON válido.")
+
+    hallazgos = _extraer_hallazgos(data.get("modulos", []))
+    if not hallazgos:
+        return _warn("No se encontraron líneas con severidad marcada "
+                      "([CRÍTICO]/[ALTO]/[MEDIO]/[BAJO]) en ese reporte.")
+
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(path_reporte))[0]
+
+    if formato == "jira":
+        path = os.path.join(out_dir, base + "_jira.csv")
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["Summary", "Issue Type", "Priority", "Description", "Labels"])
+            for h in hallazgos:
+                w.writerow([h["descripcion"][:120], "Bug", JIRA_PRIORIDAD.get(h["severidad"], "Medium"),
+                            h["descripcion"], f"osighost,{h['modulo'].replace(' ', '_')}"])
+    else:
+        path = os.path.join(out_dir, base + "_hallazgos.csv")
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["Severidad", "Módulo", "Descripción"])
+            for h in hallazgos:
+                w.writerow([h["severidad"], h["modulo"], h["descripcion"]])
+
+    counts = {}
+    for h in hallazgos:
+        counts[h["severidad"]] = counts.get(h["severidad"], 0) + 1
+    resumen = "  ".join(f"{SEV_COLOR.get(s, WHITE)}{s}: {c}{RESET}" for s, c in counts.items())
+    _ok(f"Hallazgos exportados : {len(hallazgos)}   ({resumen})")
+    _ok(f"Archivo : {path}")

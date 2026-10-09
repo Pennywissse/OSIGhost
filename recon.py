@@ -1172,3 +1172,223 @@ def mod_wayback(tgt):
         print(f"\n{YELLOW}Parámetros a revisar{RESET} :")
         for u in juicy_params[:8]:
             print(f"   {u}")
+
+
+# ---------------------------------------------------------------------------
+# 9. Fuzzing de parámetros (mapeo de superficie, SIN inyectar payloads)
+# ---------------------------------------------------------------------------
+# Prueba nombres de parámetros comunes contra la URL base y compara la
+# respuesta contra un baseline (sin parámetro): si el status/tamaño cambia
+# o el valor marcador se refleja en el HTML, el parámetro "existe" para la
+# app. No se manda ningún payload de inyección (comillas, <script>, ' OR 1=1,
+# etc.) -- es un paso previo de reconocimiento para saber qué pasarle
+# después a Burp/sqlmap dentro del alcance acordado.
+COMMON_PARAMS = [
+    "id", "page", "search", "q", "query", "redirect", "url", "next", "return",
+    "dest", "destination", "file", "path", "cmd", "exec", "action", "lang",
+    "sort", "order", "filter", "callback", "format", "debug", "test", "admin",
+    "token", "key", "secret", "api_key", "access_token", "session", "user",
+    "username", "email", "view", "template", "include", "module", "category",
+    "type", "mode", "ref", "source", "from", "to", "limit", "offset", "page_size",
+    "per_page", "download", "export", "print", "preview", "version", "lang_id",
+]
+
+
+def mod_param_fuzz(tgt, params=None, threads=20):
+    _section("Fuzzing de Parámetros")
+    if requests is None:
+        return _need("requests", "requests")
+
+    params = params or COMMON_PARAMS
+    marcador = "osig" + str(random.randint(1000, 9999))
+
+    try:
+        base_resp = requests.get(tgt.url, headers=USER_AGENT, verify=False, timeout=TIMEOUT)
+    except Exception as exc:
+        return _err(f"No se pudo conectar : {exc}")
+    base_status, base_len = base_resp.status_code, len(base_resp.content)
+    _info(f"Baseline (sin parámetros) : {base_status}  ·  {base_len} bytes")
+    _info(f"Probando {len(params)} nombres de parámetros comunes (solo lectura, sin payloads de inyección)...")
+
+    def probe(p):
+        try:
+            r = requests.get(tgt.url, params={p: marcador}, headers=USER_AGENT,
+                              verify=False, timeout=8, allow_redirects=False)
+            return p, r.status_code, len(r.content), marcador in r.text
+        except Exception:
+            return p, None, None, False
+
+    hallazgos = []
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        for p, status, length, reflejado in pool.map(probe, params):
+            if status is None:
+                continue
+            distinto = (status != base_status) or (length is not None and abs(length - base_len) > 5)
+            if reflejado or distinto:
+                hallazgos.append((p, status, length, reflejado, distinto))
+
+    if not hallazgos:
+        return _ok("Ningún parámetro probado cambió la respuesta ni se reflejó en el HTML.")
+
+    _sub(f"Parámetros con comportamiento distinto al baseline ({len(hallazgos)})")
+    for p, status, length, reflejado, distinto in hallazgos:
+        flags = []
+        if reflejado:
+            flags.append(f"{RED}reflejado en la respuesta{RESET}")
+        if distinto:
+            flags.append(f"{YELLOW}status/tamaño distinto{RESET}")
+        print(f"   {WHITE}?{p}=...{RESET}  {status}  {str(length).ljust(8)}  " + " · ".join(flags))
+
+    _warn("Esto es mapeo de superficie (qué parámetros 'existen' para la app), no una prueba de "
+          "inyección. Los marcados como reflejados son los candidatos a probar con Burp/sqlmap, "
+          "siempre dentro del alcance acordado con el cliente.")
+
+
+# ---------------------------------------------------------------------------
+# 10. Escáner de APIs REST / GraphQL
+# ---------------------------------------------------------------------------
+API_DOC_PATHS = [
+    "/api", "/api/", "/api/v1", "/api/v2", "/api/v3",
+    "/swagger.json", "/swagger.yaml", "/swagger-ui.html", "/swagger-ui/",
+    "/openapi.json", "/openapi.yaml", "/api-docs", "/api/swagger.json",
+    "/v1/swagger.json", "/v2/api-docs",
+]
+GRAPHQL_PATHS = ["/graphql", "/api/graphql", "/graphql/console", "/graphiql", "/v1/graphql"]
+
+# Query de introspección ESTÁNDAR de GraphQL: es de solo lectura (pide el
+# propio schema del servidor), no modifica nada. Si responde con el schema
+# completo es un hallazgo de hardening (no debería quedar abierta en prod).
+GRAPHQL_INTROSPECTION_QUERY = {
+    "query": "query IntrospectionQuery { __schema { queryType { name } types { name kind } } }"
+}
+
+
+def mod_api_scan(tgt, threads=10):
+    _section("Escáner de APIs (REST / GraphQL)")
+    if requests is None:
+        return _need("requests", "requests")
+    base = tgt.url
+
+    _sub("Endpoints REST / documentación")
+
+    def probe(path):
+        try:
+            r = requests.get(base + path, headers=USER_AGENT, verify=False, timeout=8, allow_redirects=False)
+            return path, r.status_code, len(r.content)
+        except Exception:
+            return path, None, None
+
+    encontrados = []
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        for path, status, length in pool.map(probe, API_DOC_PATHS):
+            if status in (200, 401, 403):
+                encontrados.append((path, status, length))
+                color = GREEN if status == 200 else YELLOW
+                print(f"   {color}{status}{RESET}  {str(length).ljust(8)} {path}")
+    if not encontrados:
+        _ok("No se encontraron endpoints/documentación de API en las rutas comunes probadas.")
+
+    _sub("GraphQL / introspección")
+    algun_graphql = False
+    for path in GRAPHQL_PATHS:
+        url = base + path
+        try:
+            r = requests.get(url, headers=USER_AGENT, verify=False, timeout=8)
+            if r.status_code == 404:
+                continue
+        except Exception:
+            continue
+        algun_graphql = True
+        try:
+            r2 = requests.post(url, json=GRAPHQL_INTROSPECTION_QUERY,
+                                headers={**USER_AGENT, "Content-Type": "application/json"},
+                                verify=False, timeout=8)
+            if r2.status_code == 200 and '"__schema"' in r2.text and '"types"' in r2.text:
+                print(f"   {RED}[CRÍTICO]{RESET} {url}  ─  introspección GraphQL ABIERTA (expone todo el schema)")
+            else:
+                print(f"   {GREEN}{path}{RESET}  responde, pero la introspección parece deshabilitada")
+        except Exception:
+            print(f"   {YELLOW}{path}{RESET}  responde, pero no se pudo probar introspección")
+    if not algun_graphql:
+        _ok("No se detectó ningún endpoint GraphQL en las rutas comunes probadas.")
+
+
+# ---------------------------------------------------------------------------
+# 11. Auditoría de buckets cloud (S3 / GCS / Azure Blob)
+# ---------------------------------------------------------------------------
+BUCKET_SUFFIXES = ["", "-assets", "-static", "-backup", "-backups", "-dev", "-prod",
+                    "-staging", "-files", "-data", "-media", "-uploads", "-public",
+                    "-private", "-logs", "-cdn", "-web", "-app", "-storage"]
+
+
+def _candidatos_bucket(base):
+    base = re.sub(r"[^a-z0-9-]", "", base.lower())
+    return [f"{base}{suf}" for suf in BUCKET_SUFFIXES if base]
+
+
+def _check_s3(nombre):
+    try:
+        r = requests.get(f"https://{nombre}.s3.amazonaws.com", timeout=6)
+    except Exception:
+        return None
+    if r.status_code == 200 and "<ListBucketResult" in r.text:
+        return "público (listado abierto)"
+    if r.status_code == 403:
+        return "existe, privado (AccessDenied)"
+    return None
+
+
+def _check_gcs(nombre):
+    try:
+        r = requests.get(f"https://storage.googleapis.com/{nombre}", timeout=6)
+    except Exception:
+        return None
+    if r.status_code == 200 and ("<ListBucketResult" in r.text or r.text.strip().startswith("{")):
+        return "público (listado abierto)"
+    if r.status_code == 403:
+        return "existe, privado"
+    return None
+
+
+def _check_azure(nombre):
+    try:
+        r = requests.get(f"https://{nombre}.blob.core.windows.net/?comp=list", timeout=6)
+    except Exception:
+        return None
+    if r.status_code == 200 and "<EnumerationResults" in r.text:
+        return "público (listado abierto)"
+    if r.status_code == 403:
+        return "existe, privado"
+    return None
+
+
+def mod_cloud_buckets(apex, threads=10):
+    _section(f"Auditoría de Buckets Cloud ─ {apex}")
+    if requests is None:
+        return _need("requests", "requests")
+
+    candidatos = _candidatos_bucket(apex)
+    if not candidatos:
+        return _err("No se pudo armar ningún nombre de bucket candidato a partir de ese dominio.")
+
+    proveedores = [("S3", _check_s3), ("GCS", _check_gcs), ("Azure Blob", _check_azure)]
+    tareas = [(nombre, prov, func) for nombre in candidatos for prov, func in proveedores]
+    _info(f"Probando {len(candidatos)} nombres candidatos × 3 proveedores ({len(tareas)} consultas)...")
+
+    def probe(t):
+        nombre, prov, func = t
+        return nombre, prov, func(nombre)
+
+    hallazgos = []
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        for nombre, prov, resultado in pool.map(probe, tareas):
+            if resultado:
+                hallazgos.append((nombre, prov, resultado))
+                color = RED if "público" in resultado else YELLOW
+                print(f"   {color}{prov.ljust(10)}{RESET} {nombre.ljust(30)} {resultado}")
+
+    if not hallazgos:
+        return _ok("Ningún bucket encontrado con los nombres candidatos probados "
+                    "(esto no descarta que existan con otro nombre).")
+    if any("público" in h[2] for h in hallazgos):
+        _warn("Hay buckets con listado público: revisar qué contenido exponen, dentro del alcance acordado.")

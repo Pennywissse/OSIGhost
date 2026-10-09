@@ -536,6 +536,68 @@ def splash():
         sys.stdout.flush()
 
 
+def autodestruccion():
+    """Efecto visual de 'autodestrucción' que se muestra al salir con
+    Ctrl+C (o Ctrl+D) desde el menú principal, en vez del 'Hasta luego.'
+    de siempre. Es SOLO una animación en la terminal: barra de progreso
+    con pasos falsos + el cartel OSIGHOST corrompiéndose letra a letra
+    hasta desaparecer. No borra ningún archivo real, ni el propio script
+    ni nada del disco."""
+    width = term_width()
+    sys.stdout.write(HIDE_CURSOR)
+    try:
+        print(f"\n{YELLOW}[!]{RESET} Interrupción detectada.")
+        time.sleep(0.4)
+
+        pasos = [
+            "Cerrando conexiones abiertas...",
+            "Purgando buffers de memoria...",
+            "Borrando huellas de la sesión...",
+            "Sobrescribiendo artefactos temporales...",
+        ]
+        bar_w = min(40, max(width - 12, 10))
+        total = len(pasos)
+        pct = 0
+        for i, texto in enumerate(pasos):
+            target = int((i + 1) * 100 / total)
+            for p in range(pct + 1, target + 1):
+                render_progress(width, bar_w, p, texto)
+                time.sleep(0.012)
+            pct = target
+        sys.stdout.write("\n\n")
+        time.sleep(0.3)
+
+        # Colapso del cartel OSIGHOST: se va corrompiendo celda a celda
+        # (letras -> símbolos de glitch -> vacío) hasta borrarse del todo.
+        banner = build_banner()
+        frame = [list(linea) for linea in banner]
+        celdas = [(y, x) for y, linea in enumerate(frame)
+                  for x, c in enumerate(linea) if c != " "]
+        rng = random.Random()
+        rng.shuffle(celdas)
+        glitch_chars = "/\\|#%@*+.·x"
+
+        pasos_glitch = 10
+        for paso in range(1, pasos_glitch + 1):
+            hasta = int(len(celdas) * paso / pasos_glitch)
+            for y, x in celdas[:hasta]:
+                frame[y][x] = " " if paso >= pasos_glitch - 1 else rng.choice(glitch_chars)
+            clear()
+            for linea in center_block(["".join(f) for f in frame], width):
+                print(f"{RED}{linea}{RESET}")
+            time.sleep(0.08)
+
+        clear()
+        for linea in center_block(["O S I G H O S T   A U T O D E S T R U I D O"], width):
+            print(f"\n\n{BOLD}{RED}{linea}{RESET}")
+        for linea in center_block(["Sesión finalizada."], width):
+            print(f"{DIM_RED}{linea}{RESET}\n")
+        time.sleep(0.7)
+    finally:
+        sys.stdout.write(SHOW_CURSOR)
+        sys.stdout.flush()
+
+
 # ---------------------------------------------------------------------------
 # Opciones del menú
 # ---------------------------------------------------------------------------
@@ -687,9 +749,84 @@ def _tool_hostaudit():
     netsec.mod_hostaudit(host)
 
 
-def _tool_reporte():
+def _tool_paramfuzz():
+    import recon
+    tgt = _pedir_target()
+    if tgt:
+        recon.mod_param_fuzz(tgt)
+
+
+def _tool_apiscan():
+    import recon
+    tgt = _pedir_target()
+    if tgt:
+        recon.mod_api_scan(tgt)
+
+
+def _tool_docker():
     import netsec
-    netsec.mod_report()
+    raw = _pedir("Objetivo (host o IP)", "HOST")
+    if not raw:
+        return
+    host = _limpiar_host(raw)
+    netsec.mod_docker_check(host)
+
+
+def _tool_buckets():
+    import recon
+    tgt = _pedir_target()
+    if tgt:
+        recon.mod_cloud_buckets(tgt.apex or tgt.domain or tgt.hostname)
+
+
+def _tool_cve():
+    import netsec
+    kw = _pedir("Producto y versión (ej: Apache 2.4.49, WordPress 5.8)", "BÚSQUEDA")
+    if not kw:
+        return
+    netsec.mod_cve_lookup(kw)
+
+
+def _tool_nmap():
+    import netsec
+
+    if not netsec._nmap_disponible():
+        print(f"\n{YELLOW}[!]{RESET} nmap no está instalado en este sistema.")
+        print(f"{WHITE}Instalalo con: sudo apt install nmap   "
+              f"(Termux: pkg install nmap  ·  Windows: nmap.org){RESET}")
+        return
+
+    raw = _pedir("Objetivo (host, dominio o IP)", "HOST")
+    if not raw:
+        return
+    host = _limpiar_host(raw)
+
+    modos = [
+        ("1", "SYN scan sigiloso (-sS, requiere privilegios)",              "syn"),
+        ("2", "Escaneo UDP (-sU, requiere privilegios)",                    "udp"),
+        ("3", "Fingerprint de Sistema Operativo (-O, requiere privilegios)", "os"),
+        ("4", "Scripts NSE · Vulnerabilidades conocidas (--script=vuln)",    "vuln"),
+        ("5", "Scripts NSE · Descubrimiento / enumeración (default+safe)",   "discovery"),
+        ("6", "Escaneo completo profesional (todo lo anterior, lento)",      "full"),
+    ]
+    print(f"\n{WHITE}¿Qué tipo de escaneo avanzado querés correr?{RESET}\n")
+    for clave, etiqueta, _ in modos:
+        print(f"    {RED}[{clave}]{WHITE} ── {etiqueta}{RESET}")
+
+    eleccion = _pedir("Elegí una opción", "MODO")
+    if not eleccion:
+        return
+    mapa = {clave: valor for clave, _, valor in modos}
+    modo = mapa.get(eleccion.strip())
+    if not modo:
+        print(f"\n{RED}[-]{RESET} Opción inválida.")
+        return
+
+    if modo in ("syn", "udp", "os", "full") and not netsec._is_admin():
+        print(f"\n{YELLOW}[!]{RESET} Este modo necesita privilegios de administrador/root "
+              f"(sockets crudos). Si no corrés OSIGhost con sudo/Administrador, nmap va a fallar.")
+
+    netsec.mod_nmap_scan(host, modo)
 
 
 # ---------------------------------------------------------------------------
@@ -697,11 +834,12 @@ def _tool_reporte():
 # ---------------------------------------------------------------------------
 def opcion_diagnostico_reporte():
     """OPCION 1: Diagnóstico y Reporte. Acá adentro están TODAS las
-    herramientas (reconocimiento web + infraestructura + reporte).
+    herramientas (reconocimiento web + infraestructura + escaneo avanzado).
 
     Cada herramienta se registra EN EL MOMENTO en que se ejecuta
-    (netsec.run_and_log), así 'Generar Reporte de la Sesión' ya tiene
-    contenido sin necesidad de salir de este submenú."""
+    (netsec.run_and_log) si hay un reporte abierto (ver [C] Crear/Cerrar
+    reporte en el menú principal); si no hay ninguno abierto, la
+    herramienta corre igual pero no queda guardada."""
     import netsec
 
     sub_menu = {
@@ -716,10 +854,13 @@ def opcion_diagnostico_reporte():
         "9":  ("Escaneo de Puertos",            _tool_portscan),
         "10": ("Descubrir Red (LAN)",           _tool_netdiscover),
         "11": ("Auditoría de Host (IP/Dominio)", _tool_hostaudit),
-        "12": ("Generar Reporte de la Sesión",  _tool_reporte),
+        "12": ("Escaneo Avanzado (nmap)",       _tool_nmap),
+        "13": ("Fuzzing de Parámetros",         _tool_paramfuzz),
+        "14": ("Escáner de APIs (REST/GraphQL)", _tool_apiscan),
+        "15": ("Contenedores / Docker Expuesto", _tool_docker),
+        "16": ("Auditoría de Buckets Cloud",    _tool_buckets),
+        "17": ("Búsqueda de CVEs (NVD)",        _tool_cve),
     }
-    # El generador de reportes no se registra a sí mismo dentro del reporte.
-    SIN_REGISTRO = {"12"}
 
     while True:
         clear()
@@ -736,10 +877,7 @@ def opcion_diagnostico_reporte():
         if choice in sub_menu:
             label, func = sub_menu[choice]
             try:
-                if choice in SIN_REGISTRO:
-                    func()
-                else:
-                    netsec.run_and_log(label, func)
+                netsec.run_and_log(label, func)
             except KeyboardInterrupt:
                 print(f"\n{RED}[-]{RESET} Interrumpido.")
             except Exception as exc:
@@ -804,6 +942,248 @@ def opcion_geolocalizacion():
 opcion_geolocalizacion.registra_por_su_cuenta = True
 
 
+# ---------------------------------------------------------------------------
+# OPCION 3: OSINT de Personas / Empleados (dorks + patrones de email)
+# ---------------------------------------------------------------------------
+def _tool_linkedin():
+    import osint
+    empresa = _pedir("Nombre de la empresa (como aparece en LinkedIn)", "EMPRESA")
+    if not empresa:
+        return
+    osint.tool_linkedin_dorks(empresa)
+
+
+def _tool_email_patterns():
+    import osint
+    dominio = _pedir("Dominio corporativo (ej: empresa.com)", "DOMINIO")
+    if not dominio:
+        return
+    print(f"\n{WHITE}Nombres completos, uno por línea (ej: Juan Pérez). "
+          f"ENTER vacío para terminar la lista (o directo para ver solo patrones de ejemplo):{RESET}")
+    lineas = []
+    while True:
+        try:
+            linea = input(f"{RED}NOMBRE{WHITE} > {RESET}").strip()
+        except (KeyboardInterrupt, EOFError):
+            break
+        if not linea:
+            break
+        lineas.append(linea)
+    osint.tool_email_patterns(dominio, "\n".join(lineas))
+
+
+def opcion_osint_personas():
+    """OPCION 3: OSINT de personas/empleados. Solo lectura y generación
+    local: dorks de búsqueda (no scrapea LinkedIn) + patrones de email
+    probables (no los verifica)."""
+    import netsec
+
+    sub_menu = {
+        "1": ("Buscar Perfiles (LinkedIn · dorks)",      _tool_linkedin),
+        "2": ("Generar Patrones de Email Corporativo",   _tool_email_patterns),
+    }
+
+    while True:
+        clear()
+        show_banner()
+        render_opciones(sub_menu, salir_label="VOLVER")
+
+        try:
+            choice = pedir_opcion("OSINT")
+        except (KeyboardInterrupt, EOFError):
+            choice = "0"
+
+        if choice == "0":
+            return
+        if choice in sub_menu:
+            label, func = sub_menu[choice]
+            try:
+                netsec.run_and_log("OSINT · " + label, func)
+            except KeyboardInterrupt:
+                print(f"\n{RED}[-]{RESET} Interrumpido.")
+            except Exception as exc:
+                print(f"\n{RED}[-]{RESET} Excepción : {exc}")
+            pausar()
+        else:
+            print(f"\n{RED}Opción inválida.{RESET}")
+            pausar()
+
+
+opcion_osint_personas.registra_por_su_cuenta = True
+
+
+# ---------------------------------------------------------------------------
+# OPCION 4: Gestión de Reportes (comparar sesiones / exportar a ticket)
+# ---------------------------------------------------------------------------
+def _listar_reportes_json(out_dir="reportes"):
+    if not os.path.isdir(out_dir):
+        return []
+    archivos = [os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.endswith(".json")]
+    return sorted(archivos, key=os.path.getmtime, reverse=True)
+
+
+def _elegir_reporte_json(etiqueta):
+    archivos = _listar_reportes_json()[:20]
+    if not archivos:
+        print(f"\n{YELLOW}[!]{RESET} No hay reportes en formato JSON en la carpeta 'reportes/'. "
+              f"Para usar esta herramienta, cerrá un reporte eligiendo JSON entre los formatos de exportación.")
+        return None
+
+    print(f"\n{WHITE}{etiqueta}{RESET}\n")
+    for i, path in enumerate(archivos, 1):
+        print(f"    {RED}[{i}]{WHITE} ── {os.path.basename(path)}{RESET}")
+
+    eleccion = _pedir("Número de la lista, o escribí una ruta", "REPORTE")
+    if not eleccion:
+        return None
+    eleccion = eleccion.strip()
+    if eleccion.isdigit() and 1 <= int(eleccion) <= len(archivos):
+        return archivos[int(eleccion) - 1]
+    return eleccion
+
+
+def _tool_comparar_reportes():
+    import netsec
+    print(f"\n{WHITE}Elegí el reporte más VIEJO (A):{RESET}")
+    path_a = _elegir_reporte_json("Reportes disponibles")
+    if not path_a:
+        return
+    print(f"\n{WHITE}Elegí el reporte más NUEVO (B):{RESET}")
+    path_b = _elegir_reporte_json("Reportes disponibles")
+    if not path_b:
+        return
+    netsec.comparar_reportes(path_a, path_b)
+
+
+def _tool_exportar_hallazgos():
+    import netsec
+    path = _elegir_reporte_json("¿Qué reporte querés exportar?")
+    if not path:
+        return
+    print(f"\n{WHITE}¿En qué formato?{RESET}\n")
+    print(f"    {RED}[1]{WHITE} ── CSV genérico (Severidad / Módulo / Descripción){RESET}")
+    print(f"    {RED}[2]{WHITE} ── CSV para importar en Jira (Summary / Priority / Description){RESET}")
+    eleccion = _pedir("ENTER = CSV genérico", "FORMATO")
+    if eleccion is None:
+        return
+    formato = "jira" if eleccion.strip() == "2" else "csv"
+    netsec.exportar_hallazgos(path, formato)
+
+
+def opcion_gestion_reportes():
+    """OPCION 4: Gestión de Reportes. Trabaja SOBRE reportes ya cerrados
+    (en formato JSON), no se registra a sí misma dentro de ningún reporte."""
+    sub_menu = {
+        "1": ("Comparar dos Reportes (diff)",           _tool_comparar_reportes),
+        "2": ("Exportar Hallazgos a Ticket (CSV/Jira)", _tool_exportar_hallazgos),
+    }
+
+    while True:
+        clear()
+        show_banner()
+        render_opciones(sub_menu, salir_label="VOLVER")
+
+        try:
+            choice = pedir_opcion("REPORTES")
+        except (KeyboardInterrupt, EOFError):
+            choice = "0"
+
+        if choice == "0":
+            return
+        if choice in sub_menu:
+            label, func = sub_menu[choice]
+            try:
+                func()
+            except KeyboardInterrupt:
+                print(f"\n{RED}[-]{RESET} Interrumpido.")
+            except Exception as exc:
+                print(f"\n{RED}[-]{RESET} Excepción : {exc}")
+            pausar()
+        else:
+            print(f"\n{RED}Opción inválida.{RESET}")
+            pausar()
+
+
+opcion_gestion_reportes.registra_por_su_cuenta = True
+
+
+def _detectar_prefijo_red(ip_local):
+    """Busca la máscara real de la interfaz con `ip` (Linux/Termux) o
+    `ipconfig` (Windows); si no la encuentra, asume /24 (lo más común en
+    redes domésticas/de oficina chicas)."""
+    import ipaddress as _ip
+
+    try:
+        if os.name == "nt":
+            salida = subprocess.run(["ipconfig"], capture_output=True, text=True,
+                                     timeout=5).stdout
+            for bloque in salida.split("\n\n"):
+                if ip_local in bloque:
+                    m = re.search(r"(?:M.scara de subred|Subnet Mask).*?:\s*([\d.]+)", bloque)
+                    if m:
+                        return _ip.IPv4Network(f"0.0.0.0/{m.group(1)}").prefixlen
+        else:
+            salida = subprocess.run(["ip", "-o", "-f", "inet", "addr", "show"],
+                                     capture_output=True, text=True, timeout=5).stdout
+            for linea in salida.splitlines():
+                if ip_local in linea:
+                    m = re.search(r"inet\s+[\d.]+/(\d+)", linea)
+                    if m:
+                        return int(m.group(1))
+    except Exception:
+        pass
+    return 24
+
+
+def _detectar_red_local():
+    """Averigua la IP de esta máquina en la red local (mirando con qué
+    interfaz saldría a internet, sin mandar tráfico real) y arma el CIDR
+    de esa red. Devuelve None si no pudo detectar nada."""
+    import socket
+    import ipaddress
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1)
+        s.connect(("8.8.8.8", 80))
+        ip_local = s.getsockname()[0]
+        s.close()
+    except Exception:
+        return None
+
+    prefijo = _detectar_prefijo_red(ip_local)
+    try:
+        return str(ipaddress.ip_network(f"{ip_local}/{prefijo}", strict=False))
+    except Exception:
+        return None
+
+
+def opcion_diagnosticar_red():
+    """OPCION 5: Diagnosticar Red. Detecta automáticamente la red local a
+    la que está conectada esta máquina y corre un escaneo completo de los
+    dispositivos conectados (reutiliza netsec.mod_netdiscover, la misma
+    herramienta de 'Descubrir Red (LAN)' dentro de Diagnóstico y Reporte)."""
+    import netsec
+
+    cidr = _detectar_red_local()
+    if cidr:
+        print(f"\n{WHITE}Red local detectada: {RED}{BOLD}{cidr}{RESET}")
+        otra = _pedir(f"ENTER para escanear {cidr}, o escribí otro rango (ej: 192.168.1.0/24)", "RED")
+        if otra is None:
+            return
+        if otra.strip():
+            cidr = otra.strip()
+    else:
+        print(f"\n{YELLOW}[!]{RESET} No se pudo detectar la red local automáticamente.")
+        cidr = _pedir("Rango de red a escanear (ej: 192.168.1.0/24)", "RED")
+        if not cidr:
+            return
+        cidr = cidr.strip()
+
+    netsec.mod_netdiscover(cidr)
+    pausar()
+
+
 def opcion_placeholder(n):
     def _run():
         print(f"\n{WHITE}Opción {n} todavía no implementada.{RESET}")
@@ -812,14 +1192,17 @@ def opcion_placeholder(n):
 
 
 # Para agregar una herramienta nueva de primer nivel: reemplazá la entrada
-# de uno de los placeholders (OPCION 2..10) por tu label y tu función.
+# de uno de los placeholders (OPCION 5..10) por tu label y tu función.
 # Para agregar una herramienta DENTRO de Diagnóstico y Reporte: sumale una
 # entrada al sub_menu de opcion_diagnostico_reporte().
 MENU = {
     "1": ("DIAGNÓSTICO Y REPORTE", opcion_diagnostico_reporte),
     "2": ("GEOLOCALIZACIÓN",       opcion_geolocalizacion),
+    "3": ("OSINT DE PERSONAS",     opcion_osint_personas),
+    "4": ("GESTIÓN DE REPORTES",   opcion_gestion_reportes),
+    "5": ("DIAGNOSTICAR RED",      opcion_diagnosticar_red),
 }
-for _n in range(3, 11):
+for _n in range(6, 11):
     MENU[str(_n)] = (f"OPCION {_n}", opcion_placeholder(_n))
 
 
@@ -913,30 +1296,285 @@ def pedir_opcion(etiqueta, footer=False):
 
 
 def footer_box(width):
-    """Recuadro de pie (mismo estilo y ancho que el cartel de arriba):
-    versión a la izquierda y tecla de actualización a la derecha."""
-    izq_txt, der_txt = f"OSIGhost v{VERSION}", "[X] Buscar actualizaciones"
+    """Bloque de pie del menú principal, de arriba hacia abajo:
+      1) Caja roja con el texto centrado "EXTRAS" (mismo estilo que el
+         cartel de arriba, pero sin contenido propio: es solo un separador).
+      2) Las 3 opciones especiales, una debajo de la otra, alineadas a la
+         izquierda con la misma sangría que el menú principal (_PAD_MENU):
+         [Z] Puente ngrok · [X] Update · [C] Nuevo reporte (la tecla [C]
+         cambia a "Cerrar reporte" si hay un reporte abierto, ver
+         netsec.REPORT_SESSION).
+      3) Una segunda caja roja a modo de pie: "OSIGhost vX.X" a la
+         izquierda y "Pennywise" en rojo/negrita a la derecha.
+    """
+    import netsec
+
+    global _PAD_MENU
     inner_w = box_inner_width(width)
     box_w = inner_w + 2
+    cabe_caja = box_w <= width
 
-    if box_w > width or len(izq_txt) + len(der_txt) + 4 > inner_w:
-        l1, l2 = izq_txt, "[X] Buscar actualizaciones"
-        return [" " * max((width - len(l1)) // 2, 0) + f"{WHITE}{l1}{RESET}",
-                " " * max((width - len(l2)) // 2, 0) + f"{RED}[X]{WHITE} Buscar actualizaciones{RESET}"]
+    # 1) Caja "EXTRAS" --------------------------------------------------
+    if cabe_caja:
+        pad = " " * ((width - box_w) // 2)
+        caja_extras = [
+            pad + f"{RED}╔{'═' * inner_w}╗{RESET}",
+            pad + f"{RED}║{BOLD}{'EXTRAS'.center(inner_w)}{RESET}{RED}║{RESET}",
+            pad + f"{RED}╚{'═' * inner_w}╝{RESET}",
+        ]
+    else:
+        caja_extras = [f"{BOLD}{RED}{'EXTRAS'.center(width)}{RESET}"]
 
-    hueco = " " * (inner_w - 2 - len(izq_txt) - len(der_txt))
-    contenido = (f" {WHITE}{izq_txt}{RESET}{hueco}"
-                 f"{RED}[X]{WHITE} Buscar actualizaciones{RESET} ")
-    pad = " " * ((width - box_w) // 2)
-    return [
-        pad + f"{RED}╔{'═' * inner_w}╗{RESET}",
-        pad + f"{RED}║{RESET}{contenido}{RED}║{RESET}",
-        pad + f"{RED}╚{'═' * inner_w}╝{RESET}",
+    # 2) Opciones Z / X / C ----------------------------------------------
+    activo = netsec.REPORT_SESSION.get("activo", False)
+    reporte_label = "Cerrar reporte" if activo else "Nuevo reporte"
+    color_c = CYAN if activo else RED
+
+    opciones = [
+        ("Z", RED, "Puente ngrok"),
+        ("X", RED, "Update"),
+        ("C", color_c, reporte_label),
     ]
+    sangria_op = " " * _PAD_MENU
+    lineas_opciones = [
+        sangria_op + f"{color}[{tecla}]{WHITE} {etiqueta}{RESET}"
+        for tecla, color, etiqueta in opciones
+    ]
+
+    # 3) Caja de pie: versión a la izquierda, "Pennywise" a la derecha --
+    izq_txt = f"OSIGhost v{VERSION}"
+    der_txt = "Pennywise"
+
+    if cabe_caja and len(izq_txt) + len(der_txt) + 4 <= inner_w:
+        hueco = " " * (inner_w - 2 - len(izq_txt) - len(der_txt))
+        contenido = f" {WHITE}{izq_txt}{RESET}{hueco}{BOLD}{RED}{der_txt}{RESET} "
+        pad = " " * ((width - box_w) // 2)
+        caja_pie = [
+            pad + f"{RED}╔{'═' * inner_w}╗{RESET}",
+            pad + f"{RED}║{RESET}{contenido}{RED}║{RESET}",
+            pad + f"{RED}╚{'═' * inner_w}╝{RESET}",
+        ]
+    else:
+        caja_pie = [
+            " " * max((width - len(izq_txt)) // 2, 0) + f"{WHITE}{izq_txt}{RESET}",
+            " " * max((width - len(der_txt)) // 2, 0) + f"{BOLD}{RED}{der_txt}{RESET}",
+        ]
+
+    return caja_extras + [""] + lineas_opciones + [""] + caja_pie
 
 
 def show_menu():
     render_opciones(MENU, salir_label="SALIR")
+
+
+# ---------------------------------------------------------------------------
+# Tecla [C]: Crear reporte / Cerrar reporte (toggle, ver footer_box)
+# ---------------------------------------------------------------------------
+def _elegir_formatos_reporte():
+    """Pregunta en qué formato(s) exportar. Permite varios separados por
+    coma (ej: '1,3') o ENTER para el default (HTML + TXT)."""
+    opciones = [
+        ("1", "html", "HTML (para adjuntar o convertir a PDF)"),
+        ("2", "txt",  "TXT (texto plano)"),
+        ("3", "json", "JSON (para parsear / integrar con otra herramienta)"),
+        ("4", "md",   "Markdown"),
+    ]
+    print(f"\n{WHITE}¿En qué formato(s) querés exportarlo?{RESET}\n")
+    for clave, _, etiqueta in opciones:
+        print(f"    {RED}[{clave}]{WHITE} ── {etiqueta}{RESET}")
+
+    raw = _pedir("Varios separados por coma. ENTER = HTML + TXT", "FORMATOS")
+    if raw is None:
+        return None
+    if not raw.strip():
+        return ["html", "txt"]
+
+    mapa = {clave: fmt for clave, fmt, _ in opciones}
+    nombres_validos = {fmt for _, fmt, _ in opciones}
+    elegidos = []
+    for token in raw.split(","):
+        token = token.strip().lower()
+        if token in mapa:
+            elegidos.append(mapa[token])
+        elif token in nombres_validos:
+            elegidos.append(token)
+    return elegidos or ["html", "txt"]
+
+
+def _abrir_terminal_con(comando):
+    """Abre una terminal NUEVA corriendo `comando`, totalmente
+    desenganchada de OSIGhost (stdin/stdout/stderr propios y su propia
+    sesión de proceso) para que OSIGhost quede libre al toque y no
+    compita por la entrada de teclado con la ventana nueva.
+    - Windows: una consola nueva (start ... cmd /k).
+    - Termux: no hay ventanas nuevas posibles, así que lo manda a
+      segundo plano con nohup y avisa dónde queda el log.
+    - Linux: prueba varios emuladores de terminal comunes, en orden.
+    Lanza RuntimeError si en Linux no encuentra ninguno instalado."""
+    detach = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL)
+
+    if os.name == "nt":
+        subprocess.Popen(f'start "OSIGhost - Puente ngrok" cmd /k {comando}',
+                          shell=True, close_fds=True, **detach)
+        return "ventana"
+
+    detach["start_new_session"] = True  # setsid: no comparte sesión/TTY con OSIGhost
+
+    if "TERMUX_VERSION" in os.environ:
+        subprocess.Popen(f"nohup {comando} > ngrok.log 2>&1 &", shell=True, **detach)
+        return "segundo_plano"
+
+    terminales = [
+        ("x-terminal-emulator", ["-e", "bash", "-c", f"{comando}; exec bash"]),
+        ("gnome-terminal",      ["--", "bash", "-c", f"{comando}; exec bash"]),
+        ("konsole",             ["-e", "bash", "-c", f"{comando}; exec bash"]),
+        ("xfce4-terminal",      ["-e", "bash", "-c", f"{comando}; exec bash"]),
+        ("mate-terminal",       ["-e", "bash", "-c", f"{comando}; exec bash"]),
+        ("xterm",               ["-e", "bash", "-c", f"{comando}; exec bash"]),
+    ]
+    for binario, args in terminales:
+        ruta = shutil.which(binario)
+        if ruta:
+            subprocess.Popen([ruta] + args, **detach)
+            return "ventana"
+
+    raise RuntimeError("no se encontró ningún emulador de terminal conocido "
+                        "(probá instalar xterm: sudo apt install xterm)")
+
+
+def _ngrok_config_path():
+    """Le pregunta a ngrok mismo dónde está su archivo de configuración
+    (`ngrok config check`): es más confiable que adivinar la ruta
+    nosotros, sobre todo corriendo como root/sudo, donde $HOME puede no
+    ser el del usuario que configuró el token."""
+    try:
+        salida = subprocess.run(["ngrok", "config", "check"],
+                                 capture_output=True, text=True, timeout=5)
+        texto = (salida.stdout or "") + (salida.stderr or "")
+        m = re.search(r"(?:configuration )?file at\s+(\S+)", texto, re.I)
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
+def _ngrok_autenticado():
+    """Heurística: ¿ngrok tiene guardado un authtoken? Primero le pregunta
+    a ngrok dónde está su config real; si no puede, prueba las rutas
+    típicas de cada sistema (incluyendo el $HOME del usuario real cuando
+    se corre con sudo). No valida que el token sea VÁLIDO (eso recién se
+    sabe al conectar), solo que haya uno guardado — así que un 'no' acá
+    puede ser un falso positivo y nunca debería bloquear, solo avisar."""
+    rutas = []
+
+    ruta_real = _ngrok_config_path()
+    if ruta_real:
+        rutas.append(ruta_real)
+
+    homes = [os.path.expanduser("~")]
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        homes += [f"/home/{sudo_user}", f"/Users/{sudo_user}"]
+
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    for h in homes:
+        if xdg:
+            rutas.append(os.path.join(xdg, "ngrok", "ngrok.yml"))
+        rutas.append(os.path.join(h, ".config", "ngrok", "ngrok.yml"))
+        rutas.append(os.path.join(h, ".config", "ngrok", "ngrok.yaml"))
+        rutas.append(os.path.join(h, ".ngrok2", "ngrok.yml"))  # formato viejo (v2)
+        rutas.append(os.path.join(h, "Library", "Application Support", "ngrok", "ngrok.yml"))
+
+    if os.name == "nt":
+        localapp = os.environ.get("LOCALAPPDATA", "")
+        if localapp:
+            rutas.append(os.path.join(localapp, "ngrok", "ngrok.yml"))
+
+    vistos = set()
+    for ruta in rutas:
+        if not ruta or ruta in vistos:
+            continue
+        vistos.add(ruta)
+        try:
+            with open(ruta, "r", encoding="utf-8") as f:
+                if "authtoken" in f.read():
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _tool_puente_ngrok():
+    """[Z] Pide un puerto, lo confirma y abre una terminal nueva con el
+    puente ngrok lanzado ahí (`ngrok http <puerto>`)."""
+    if not shutil.which("ngrok"):
+        print(f"\n{YELLOW}[!]{RESET} ngrok no está instalado o no está en el PATH.")
+        print(f"{WHITE}Instalalo desde https://ngrok.com/download y configurá tu "
+              f"token con 'ngrok config add-authtoken <TOKEN>' antes de usar esta opción.{RESET}")
+        return
+
+    if not _ngrok_autenticado():
+        # Es solo una heurística (puede dar falso positivo, p. ej. corriendo
+        # con sudo), así que avisa pero NO bloquea ni pide confirmación.
+        print(f"\n{YELLOW}[!]{RESET} No pude confirmar que ngrok tenga un authtoken "
+              f"configurado (puede ser un falso positivo si ya lo configuraste).")
+        print(f"{WHITE}Si el túnel falla con 'ERR_NGROK_4018', corré: "
+              f"{RED}ngrok config add-authtoken <TU_TOKEN>{RESET}")
+
+    raw = _pedir("Puerto local a exponer con ngrok (ej: 8000)", "PUERTO")
+    if not raw:
+        return
+    try:
+        puerto = int(raw.strip())
+        if not (1 <= puerto <= 65535):
+            raise ValueError
+    except ValueError:
+        print(f"\n{RED}[-]{RESET} Puerto inválido: tiene que ser un número entre 1 y 65535.")
+        return
+
+    confirmar = _pedir(f"¿Abrir el puente ngrok en el puerto {puerto}? (s/N)", "CONFIRMAR")
+    if confirmar is None or confirmar.strip().lower() not in ("s", "si", "sí", "y", "yes"):
+        print(f"\n{WHITE}Cancelado.{RESET}")
+        return
+
+    comando = f"ngrok http {puerto}"
+    try:
+        modo = _abrir_terminal_con(comando)
+    except Exception as exc:
+        print(f"\n{RED}[-]{RESET} No se pudo abrir una terminal nueva: {exc}")
+        print(f"{WHITE}Corré esto manualmente: {comando}{RESET}")
+        return
+
+    if modo == "segundo_plano":
+        print(f"\n{YELLOW}[!]{RESET} Termux no soporta ventanas nuevas: el puente quedó "
+              f"corriendo en segundo plano (log en ./ngrok.log).")
+    else:
+        print(f"\n{GREEN}[+]{RESET} Puente ngrok lanzado en una terminal nueva (puerto {puerto}).")
+
+
+def _tool_crear_reporte():
+    import netsec
+    nombre = _pedir("Nombre del reporte (ej: cliente_acme_octubre)", "NOMBRE")
+    if not nombre:
+        print(f"\n{YELLOW}[!]{RESET} Operación cancelada: hace falta un nombre.")
+        return
+    fecha = _pedir("Fecha del trabajo (ej: 2026-10-08). ENTER = hoy", "FECHA")
+    if fecha is None:
+        return
+    netsec.iniciar_reporte(nombre, fecha)
+
+
+def _tool_cerrar_reporte():
+    import netsec
+    fecha = _pedir("Fecha de cierre (ej: 2026-10-08). ENTER = hoy", "FECHA")
+    if fecha is None:
+        return
+    formatos = _elegir_formatos_reporte()
+    if formatos is None:
+        return
+    netsec.cerrar_reporte(fecha, formatos)
 
 
 def main():
@@ -959,11 +1597,21 @@ def main():
         try:
             choice = pedir_opcion("OSIGhost", footer=True)
         except (KeyboardInterrupt, EOFError):
-            choice = "0"
+            autodestruccion()
+            break
 
         if choice == "0":
             print(f"\n{WHITE}Hasta luego.{RESET}")
             break
+        if choice.lower() == "z":
+            try:
+                _tool_puente_ngrok()
+            except KeyboardInterrupt:
+                print(f"\n{RED}[-]{RESET} Interrumpido.")
+            except Exception as exc:
+                print(f"\n{RED}[-]{RESET} Error : {exc}")
+            pausar()
+            continue
         if choice.lower() == "x":
             import updater
             try:
@@ -972,6 +1620,18 @@ def main():
                 print(f"\n{RED}[-]{RESET} Interrumpido.")
             except Exception as exc:
                 print(f"\n{RED}[-]{RESET} Error al buscar actualizaciones : {exc}")
+            pausar()
+            continue
+        if choice.lower() == "c":
+            try:
+                if netsec.REPORT_SESSION.get("activo"):
+                    _tool_cerrar_reporte()
+                else:
+                    _tool_crear_reporte()
+            except KeyboardInterrupt:
+                print(f"\n{RED}[-]{RESET} Interrumpido.")
+            except Exception as exc:
+                print(f"\n{RED}[-]{RESET} Error : {exc}")
             pausar()
             continue
         if choice in MENU:
